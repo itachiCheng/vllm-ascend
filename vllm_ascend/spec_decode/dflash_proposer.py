@@ -4,6 +4,10 @@ import torch
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.spec_decode.dflash_utils import (
+    build_dflash_micro_block_query_kv_mask,
+    validate_dflash_micro_block_layout,
+)
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -59,6 +63,40 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.parallel_drafting_hidden_state_tensor = None
+
+        dflash_config = getattr(
+            self.draft_model_config.hf_config, "dflash_config", {}
+        )
+        if dflash_config is None:
+            dflash_config = {}
+        self.dflash_block_size = dflash_config.get(
+            "block_size", 1 + self.num_speculative_tokens
+        )
+        self.dflash_micro_block_size = dflash_config.get("micro_block_size") or None
+        self.dflash_anchor_len = dflash_config.get("anchor_len", 1)
+        validate_dflash_micro_block_layout(
+            block_size=self.dflash_block_size,
+            micro_block_size=self.dflash_micro_block_size,
+            anchor_len=self.dflash_anchor_len,
+        )
+
+    def _build_micro_block_attn_mask(
+        self,
+        cad: CommonAttentionMetadata,
+    ) -> torch.Tensor | None:
+        if self.dflash_micro_block_size is None:
+            return None
+        return build_dflash_micro_block_query_kv_mask(
+            query_start_loc=cad.query_start_loc,
+            seq_lens=cad.seq_lens,
+            num_reqs=cad.num_reqs,
+            num_actual_tokens=cad.num_actual_tokens,
+            max_seq_len=cad.max_seq_len,
+            block_size=self.dflash_block_size,
+            micro_block_size=self.dflash_micro_block_size,
+            anchor_len=self.dflash_anchor_len,
+            device=self.device,
+        )
 
     def set_inputs_first_pass(
         self,
@@ -142,7 +180,11 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.max_seq_len = cad.max_seq_len + num_query_per_req
         cad.slot_mapping = query_slot_mapping
         cad.causal = False
-        cad.attn_mask = None
+        cad.dflash_micro_block_size = self.dflash_micro_block_size
+        cad.dflash_anchor_len = self.dflash_anchor_len
+        cad.dflash_block_size = self.dflash_block_size
+        cad.custom_attn_mask = self._build_micro_block_attn_mask(cad)
+        cad.attn_mask = cad.custom_attn_mask
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
         return num_query_total, token_indices_to_sample, cad, None
@@ -178,22 +220,38 @@ class AscendDflashProposer(AscendEagleProposer):
         multi_steps_attn_metadata = []
         if aclgraph_runtime_mode == CUDAGraphMode.FULL and len(self.runner.attn_groups) > 0:
             builder = self.draft_attn_groups[0].get_metadata_builder()
+            seq_lens = self.runner.seq_lens[:num_reqs] + num_query_per_req
+            if num_reqs:
+                max_seq_len = int(
+                    (
+                        self.runner.optimistic_seq_lens_cpu[:num_reqs]
+                        + num_query_per_req
+                    ).max().item()
+                )
+            else:
+                max_seq_len = num_query_per_req
             common_attn_metadata = AscendCommonAttentionMetadata(
                 query_start_loc=self.arange_dflash[: num_reqs + 1] * num_query_per_req,
                 query_start_loc_cpu=torch.from_numpy(self.token_arange_np[: num_reqs + 1]).clone() * num_query_per_req,
                 seq_lens_cpu=self.runner.optimistic_seq_lens_cpu,
                 seq_lens_cpu_upper_bound=self.runner.optimistic_seq_lens_cpu,
-                seq_lens=self.runner.seq_lens[:num_reqs],
+                seq_lens=seq_lens,
                 num_reqs=num_reqs,
                 num_actual_tokens=num_query_tokens,
                 max_query_len=num_query_per_req,
-                max_seq_len=0,
+                max_seq_len=max_seq_len,
                 slot_mapping=self._slot_mapping_buffer[:num_query_total],
                 attn_state=AscendAttentionState.ChunkedPrefill,
                 causal=False,
+                dflash_micro_block_size=self.dflash_micro_block_size,
+                dflash_anchor_len=self.dflash_anchor_len,
+                dflash_block_size=self.dflash_block_size,
                 block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
                     :num_reqs
                 ],
+            )
+            common_attn_metadata.custom_attn_mask = self._build_micro_block_attn_mask(
+                common_attn_metadata
             )
 
             attn_metadata_dflash = builder.build_for_graph_capture(
@@ -201,7 +259,7 @@ class AscendDflashProposer(AscendEagleProposer):
                 AscendAttentionState.ChunkedPrefill,
             )
 
-            attn_metadata_dflash.attn_mask = None
+            attn_metadata_dflash.attn_mask = common_attn_metadata.custom_attn_mask
             attn_metadata_dflash.attn_state = AscendAttentionState.ChunkedPrefill
 
             per_layer_attn_metadata = dict()

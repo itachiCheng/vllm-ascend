@@ -237,6 +237,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
             encoder_seq_lens_cpu=_slice_reqs(self.encoder_seq_lens_cpu),
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
+            dflash_micro_block_size=self.dflash_micro_block_size,
+            dflash_anchor_len=self.dflash_anchor_len,
+            dflash_block_size=self.dflash_block_size,
+            custom_attn_mask=self.custom_attn_mask,
         )
 
 

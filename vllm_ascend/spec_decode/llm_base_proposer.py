@@ -737,7 +737,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
         attn_metadata = builder.build(0, common_attn_metadata, self.runner.get_model(), **extra_attn_metadata_args)
 
-        if hasattr(attn_metadata, "causal") and not attn_metadata.causal:
+        has_custom_attn_mask = common_attn_metadata.custom_attn_mask is not None
+        if (
+            hasattr(attn_metadata, "causal")
+            and not attn_metadata.causal
+            and not has_custom_attn_mask
+        ):
             attn_metadata.attn_mask = None
 
         if self.uses_mrope:
